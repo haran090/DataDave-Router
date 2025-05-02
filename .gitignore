@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+ENV/
+env/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# NiceGUI cache
+.nicegui/
+
+# Executables
+*.exe
+*.app
+dist/
+build/
+
+# VSCode
+.vscode/
