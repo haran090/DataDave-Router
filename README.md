@@ -1,6 +1,6 @@
 # 🚀 Dave Tunnel Mode Router
 
-![Dave Router Banner](dave_connected.png)
+<img src="dave_connected.png" alt="Dave Router Banner" width="250"/>
 
 Want to use [Data Dave](https://data-dave.xyz) on a database behind a firewall? 
 Do you need VPN or LAN access to your database? Easily connect Dave to route SQL queries securely via WebSocket through your machine.
@@ -55,8 +55,6 @@ Just double-click to launch!
 - The app establishes a **WebSocket** connection to your backend.
 - Send SQL queries and receive results in real-time.
 - All activity is logged in the **terminal panel** for transparency.
-
-![Screenshot](dave_connected.png)
 
 ---
 
