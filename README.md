@@ -1,6 +1,6 @@
-# 🚀 Dave Tunnel Mode Router
+# Dave Router - Tunnel Mode
 
-<img src="dave_connected.png" alt="Dave Router Banner" width="250"/>
+<img src="banner.png" alt="Dave Router Banner" width="800"/>
 
 Want to use [Data Dave](https://data-dave.xyz) on a database behind a firewall? 
 Do you need VPN or LAN access to your database? Easily connect Dave to route SQL queries securely via WebSocket through your machine.
