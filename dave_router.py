@@ -381,10 +381,10 @@ def create_ui():
 
         def on_login_click():
             global connected_username, ws_connection
-            # username = username_input.value
-            # password = password_input.value
-            username = "admin"
-            password = "adminPass"
+            username = username_input.value
+            password = password_input.value
+            # username = "admin"
+            # password = "adminPass"
 
             if ws_connection:
                 add_terminal_message("Already connected. Disconnect first if needed.", "info")
