@@ -6,6 +6,9 @@ from nicegui import ui, app
 from queue import Queue
 import time
 import sqlalchemy
+import logging
+import datetime
+import decimal
 
 # Global variables to track connection state
 ws_connection = None
@@ -44,6 +47,8 @@ def execute_test_connection(connectionObject, query="SELECT 1"):
 
 def ws_thread(url, username, password):
     global ws_connection, connected_username
+    logging.basicConfig(level=logging.DEBUG)
+    logger = logging.getLogger("dave_router.ws_thread")
     try:
         ws = websocket.create_connection(url)
         ws_connection = ws
@@ -65,33 +70,91 @@ def ws_thread(url, username, password):
         # Keep alive
         while True:
             msg = ws.recv()
+            logger.debug(f"Received raw message: {msg}")
             print(f"Received message: {msg}")
             # Try to parse as JSON for tunnel mode
             try:
                 data = json.loads(msg)
                 if data.get("type") == "sql-query":
-                    # Execute the test connection
-                    message_queue.put({"type": "info", "message": f"Executing query: {data.get('query', '')}"})
-                    success, message, tables = execute_test_connection(
-                        data["connectionObject"], data.get("query", "SELECT 1")
-                    )
-                    # NEW: Add SQL result message
-                    if success:
-                        # Simulate row count (since SELECT 1 returns 1 row)
-                        row_count = 1  # You may want to actually fetch and count rows for real queries
-                        message_queue.put({"type": "sql_success", "message": f"SQL Success: {row_count} row(s) returned."})
-                    else:
-                        message_queue.put({"type": "sql_error", "message": f"SQL Error: {message}"})
+                    logger.info(f"Received sql-query: request_id={data.get('request_id')}, query={data.get('query')}, connectionObject={data.get('connectionObject')}")
+                    # message_queue.put({"type": "info", "message": f"Executing query: {data.get('query', '')}"})
+                    connectionObject = data["connectionObject"]
+                    query = data.get("query", "SELECT 1")
+                    queryParams = data.get("queryParams", None)
+                    request_id = data.get("request_id")
+
+                    # Prepare detailed event for sql execution info
+                    sql_query_event = {
+                        "type": "sql_execution_info",
+                        "query": query,
+                        "connectionObject": connectionObject,
+                        "queryParams": queryParams,
+                        "request_id": request_id,
+                        "message": f"Executing query (ID: {request_id}): {query[:100]}{'...' if len(query) > 100 else ''}" # Original message for fallback/logging
+                    }
+                    message_queue.put(sql_query_event)
+
                     response = {
                         "type": "sql-query-result",
-                        "request_id": data.get("request_id"),
-                        "success": success,
-                        "message": message,
-                        "tables": tables
+                        "request_id": request_id,
+                        "success": False,
+                        "message": "",
+                        "keys": [],
+                        "rows": [],
+                        "rowcount": -1
                     }
+                    try:
+                        # Build SQLAlchemy URL
+                        dialect = connectionObject.get("dialect", "mysql")
+                        user = connectionObject["user"]
+                        password = connectionObject["password"]
+                        host = connectionObject["host"]
+                        port = connectionObject["port"]
+                        database = connectionObject["database"]
+                        schema = connectionObject.get("schema", None)
+                        if dialect == "postgresql":
+                            url = f"postgresql://{user}:{password}@{host}:{port}/{database}/{schema}" if schema else f"postgresql://{user}:{password}@{host}:{port}/{database}"
+                        elif dialect == "mysql":
+                            url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+                        else:
+                            url = f"{dialect}://{user}:{password}@{host}:{port}/{database}"
+                        logger.info(f"Connecting to DB: {url}")
+                        engine = sqlalchemy.create_engine(url)
+                        with engine.connect() as conn:
+                            # Use SQLAlchemy text for parametrized queries
+                            stmt = sqlalchemy.text(query)
+                            logger.info(f"Executing SQL: {query} with params: {queryParams}")
+                            result = conn.execute(stmt, queryParams or {})
+                            # Try to fetch results if it's a SELECT
+                            if result.returns_rows:
+                                rows = result.fetchall()
+                                keys = result.keys()
+                                response["keys"] = list(keys)
+                                response["rows"] = [[convert_json_safe(cell) for cell in row] for row in rows]
+                                response["rowcount"] = result.rowcount if result.rowcount is not None else len(rows)
+                                # Scalar result if only one row and one column
+                                if len(rows) == 1 and len(rows[0]) == 1:
+                                    response["scalar_result"] = convert_json_safe(rows[0][0])
+                            else:
+                                response["rowcount"] = result.rowcount
+                            # Optionally, return tables if requested (for metadata queries)
+                            if query.strip().lower() in ("show tables", "select table_name from information_schema.tables where table_schema = database()"):
+                                inspector = sqlalchemy.inspect(engine)
+                                response["tables"] = inspector.get_table_names(schema=database)
+                            response["success"] = True
+                            response["message"] = "Query executed successfully"
+                            message_queue.put({"type": "sql_success", "message": f"SQL Success: {response['rowcount']} row(s) returned."})
+                            logger.info(f"Query success: request_id={request_id}, rowcount={response['rowcount']}")
+                    except Exception as e:
+                        response["success"] = False
+                        response["message"] = str(e)
+                        message_queue.put({"type": "sql_error", "message": f"SQL Error: {str(e)}"})
+                        logger.error(f"Query error: request_id={request_id}, error={str(e)}")
+                    logger.info(f"Sending response: request_id={request_id}, success={response['success']}, rowcount={response['rowcount']}")
                     ws.send(json.dumps(response))
                     continue
-            except Exception:
+            except Exception as e:
+                logger.error(f"Exception in ws_thread message handler: {str(e)}")
                 pass
             # message_queue.put(f"Received: {msg}")
     except Exception as e:
@@ -196,14 +259,108 @@ def create_ui():
                 with ui.row().classes('w-full h-full text-white pb-8 p-3 items-center'):
                     ui.label('Message Queue').classes('text-lg font-medium')
                     ui.space()
+                    def clear_logs():
+                        message_history.clear()
+                        terminal_container.clear()
+                        message_count.text = 'Messages: 0'
+                    ui.button(on_click=clear_logs, icon='delete').props('color=error flat dense').classes('mr-2').style('color: #ef4444').tooltip('Clear logs')
                     connection_status = ui.label('Disconnected').classes('text-sm rounded px-2 py-1 bg-red-500')
                     ui.label('|').classes('mx-2 text-gray-500')
                     message_count = ui.label('Messages: 0').classes('text-sm')
                     terminal_container = ui.scroll_area().classes('w-full h-full terminal-container flex-grow')
+                    terminal_scroll_area = terminal_container  # Save reference for scrolling
 
         # Store message history
         message_history = []
-                    
+        # Buffer for pending terminal messages
+        pending_terminal_messages = []
+        
+        def flush_terminal_messages():
+            """Flush all buffered terminal messages to the UI at once."""
+            nonlocal pending_terminal_messages
+            for args in pending_terminal_messages:
+                _add_terminal_message_to_ui(*args)
+            pending_terminal_messages.clear()
+            message_count.text = f"Messages: {len(message_history)}"
+            if terminal_scroll_area:
+                terminal_scroll_area.scroll_to(percent=100)
+
+        def _add_terminal_message_to_ui(content_or_data, type="normal"):
+            """Internal: Actually add a message to the terminal UI and message_history."""
+            timestamp = time.strftime("%H:%M:%S", time.localtime())
+            if type == "sql_query" and isinstance(content_or_data, dict):
+                query_data = content_or_data
+                raw_query = query_data.get('query', '')
+                display_query = " ".join(raw_query.split()).strip()
+                max_len = 70
+                if len(display_query) > max_len:
+                    summary_text = f"{display_query[:max_len-3]}..."
+                else:
+                    summary_text = display_query
+                display_text = f"Executing Query: {summary_text}"
+                message_history.insert(0, (timestamp, display_text, "info_clickable", query_data))
+                with terminal_container:
+                    new_row = ui.row().classes('terminal-message w-full items-center')
+                    with new_row:
+                        ui.label(f"[{timestamp}]").classes('terminal-time')
+                        clickable_label = ui.label(display_text).classes(f'flex-grow terminal-info cursor-pointer hover:underline')
+                        clickable_label.on('click', lambda _, qd=query_data: show_sql_query_dialog(qd))
+            else:
+                text_content = str(content_or_data.get("message") if isinstance(content_or_data, dict) and "message" in content_or_data else content_or_data)
+                message_history.insert(0, (timestamp, text_content, type))
+                with terminal_container:
+                    new_row = ui.row().classes('terminal-message w-full')
+                    with new_row:
+                        ui.label(f"[{timestamp}]").classes('terminal-time')
+                        msg_class = f"terminal-{type}" if type in ["success", "error", "info"] else ""
+                        ui.label(text_content).classes(f'flex-grow {msg_class}')
+
+        def add_terminal_message(content_or_data, type="normal"):
+            """Buffer a message to be added to the terminal UI on the next flush."""
+            pending_terminal_messages.append((content_or_data, type))
+
+        def show_sql_query_dialog(query_data):
+            with ui.dialog() as dialog, ui.card().classes(
+                'min-w-[600px] max-w-[80vw] dark:bg-gray-800 rounded-lg shadow-xl' # Dark mode, rounded, shadow
+            ):
+                ui.label("Query Details").classes(
+                    'text-xl font-semibold mb-4 text-gray-800 dark:text-gray-100' # Adjusted title styling
+                )
+                
+                # Process query for display: strip overall, handle multi-line indentation, and replace backticks with single quotes
+                original_query = query_data['query'].strip().replace('`', "'")
+                lines = original_query.split('\n')
+                if len(lines) > 1:
+                    processed_lines = [lines[0]]
+                    for line in lines[1:]:
+                        stripped_line = line.lstrip()
+                        if len(line) > len(stripped_line):
+                            processed_lines.append('\t' + stripped_line)
+                        else:
+                            processed_lines.append(line)
+                    query_to_display = '\n'.join(processed_lines)
+                else:
+                    query_to_display = original_query
+
+                ui.code(query_to_display).classes(
+                    'w-full text-xs bg-gray-100 dark:bg-gray-700 p-3 rounded-md max-h-72 overflow-y-auto font-mono border border-gray-300 dark:border-gray-600'
+                )
+
+                # Conditional display of parameters
+                if query_data.get('queryParams'):
+                    try:
+                        query_params_str = json.dumps(query_data['queryParams'], indent=2)
+                    except Exception:
+                        query_params_str = str(query_data['queryParams']) # Fallback
+                    ui.code(query_params_str).classes(
+                        'w-full text-xs bg-gray-100 dark:bg-gray-700 p-3 rounded-md max-h-48 overflow-y-auto font-mono border border-gray-300 dark:border-gray-600'
+                    )
+                
+                ui.button('Close', on_click=dialog.close).props('color=primary flat').classes(
+                    'mt-6 self-end text-primary-500 dark:text-primary-400 hover:bg-gray-100 dark:hover:bg-gray-700 px-4 py-2 rounded-md'
+                )
+            dialog.open()
+
         def disconnect_ws():
             global ws_connection, connected_username
             if ws_connection:
@@ -251,30 +408,6 @@ def create_ui():
                 daemon=True
             ).start()
             
-        def add_terminal_message(text, type="normal"):
-            """Add a message to the terminal with timestamp"""
-            timestamp = time.strftime("%H:%M:%S", time.localtime())
-            
-            # Insert at the beginning for reverse order
-            message_history.insert(0, (timestamp, text, type))
-            
-            # Clear and re-render all messages in reverse order (newest first)
-            terminal_container.clear()
-            for ts, msg, msg_type in message_history:
-                with terminal_container:
-                    with ui.row().classes('terminal-message w-full'):
-                        ui.label(f"[{ts}]").classes('terminal-time')
-                        msg_class = f"terminal-{msg_type}" if msg_type in ["success", "error", "info"] else ""
-                        ui.label(msg).classes(f'flex-grow {msg_class}')
-            
-            # Update message count
-            message_count.text = f"Messages: {len(message_history)}"
-            
-            # Scroll to top (since newest is at the top)
-            ui.run_javascript("""
-                document.querySelector('.terminal').scrollTop = 0;
-            """)
-            
         def update_ui_state():
             # Update UI elements based on connection state
             if ws_connection and connected_username:
@@ -300,13 +433,11 @@ def create_ui():
 
         def check_messages():
             """Check for messages from the websocket thread and update UI"""
-            if not message_queue.empty():
+            updated = False
+            while not message_queue.empty():
                 msg_obj = message_queue.get()
-                # msg_obj is now a dict: {"type": ..., "message": ...}
                 msg_type = msg_obj.get("type", "normal")
                 message = msg_obj.get("message", "")
-
-                # Only update the status label for connection/disconnection
                 if msg_type == "connected":
                     status_label.text = f"Connected as {connected_username}"
                     status_image.set_source('dave_connected.png')
@@ -327,9 +458,13 @@ def create_ui():
                     add_terminal_message(message, "success")
                 elif msg_type == "sql_error":
                     add_terminal_message(message, "error")
+                elif msg_type == "sql_execution_info":
+                    add_terminal_message(msg_obj, "sql_query")
                 else:
-                    # All other messages go to the terminal only
                     add_terminal_message(message, "info" if msg_type == "info" else "normal")
+                updated = True
+            if pending_terminal_messages:
+                flush_terminal_messages()
 
         # Set up a timer to check for messages from the WebSocket thread
         ui.timer(0.5, check_messages)
@@ -337,7 +472,22 @@ def create_ui():
 # Run the NiceGUI app
 def main():
     create_ui()
-    ui.run(title='Dave Router', port=8180)
+    ui.run(title='Dave Router', port=8180, favicon="https://cdn-icons-png.flaticon.com/128/6584/6584942.png")
+
+# Helper to convert values to JSON-serializable types
+def convert_json_safe(val):
+    if isinstance(val, bytes):
+        try:
+            return val.decode('utf-8')
+        except UnicodeDecodeError:
+            if len(val) == 1:
+                return int.from_bytes(val, 'little')
+            return val.hex()
+    if isinstance(val, (datetime.date, datetime.datetime)):
+        return val.isoformat()
+    if isinstance(val, decimal.Decimal):
+        return str(val)
+    return val
 
 if __name__ in {"__main__", "__mp_main__"}:
     main() 
