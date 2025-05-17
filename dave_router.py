@@ -9,7 +9,7 @@ import sqlalchemy
 import logging
 import datetime
 import decimal
-
+import urllib.parse
 # Global variables to track connection state
 ws_connection = None
 connected_username = None
@@ -27,7 +27,9 @@ def execute_test_connection(connectionObject, query="SELECT 1"):
         database = connectionObject["database"]
         schema = connectionObject.get("schema", None)
         if dialect == "postgresql":
-            url = f"postgresql://{user}:{password}@{host}:{port}/{database}/{schema}"
+            url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}"
+            if schema:
+                url += f"?options=-csearch_path%3D{urllib.parse.quote_plus(schema)}"
         elif dialect == "mysql":
             url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
         else:
