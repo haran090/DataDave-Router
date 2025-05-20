@@ -28,14 +28,17 @@ def execute_test_connection(connectionObject, query="SELECT 1"):
         schema = connectionObject.get("schema", None)
         if dialect == "postgresql":
             url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}"
+            connect_args = {}
             if schema:
-                url += f"?options=-csearch_path%3D{urllib.parse.quote_plus(schema)}"
+                connect_args["options"] = f"-c search_path={schema}"
+            engine = sqlalchemy.create_engine(url, connect_args=connect_args)
         elif dialect == "mysql":
             url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+            engine = sqlalchemy.create_engine(url)
         else:
             url = f"{dialect}://{user}:{password}@{host}:{port}/{database}"
+            engine = sqlalchemy.create_engine(url)
         print(f"URL: {url}")
-        engine = sqlalchemy.create_engine(url)
         with engine.connect() as conn:
             # Run the test query
             conn.execute(sqlalchemy.text(query))
@@ -115,13 +118,18 @@ def ws_thread(url, username, password):
                         database = connectionObject["database"]
                         schema = connectionObject.get("schema", None)
                         if dialect == "postgresql":
-                            url = f"postgresql://{user}:{password}@{host}:{port}/{database}/{schema}" if schema else f"postgresql://{user}:{password}@{host}:{port}/{database}"
+                            url = f"postgresql://{user}:{password}@{host}:{port}/{database}"
+                            connect_args = {}
+                            if schema:
+                                connect_args["options"] = f"-c search_path={schema}"
+                            engine = sqlalchemy.create_engine(url, connect_args=connect_args)
                         elif dialect == "mysql":
                             url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+                            engine = sqlalchemy.create_engine(url)
                         else:
                             url = f"{dialect}://{user}:{password}@{host}:{port}/{database}"
+                            engine = sqlalchemy.create_engine(url)
                         logger.info(f"Connecting to DB: {url}")
-                        engine = sqlalchemy.create_engine(url)
                         with engine.connect() as conn:
                             # Use SQLAlchemy text for parametrized queries
                             stmt = sqlalchemy.text(query)
