@@ -10,6 +10,9 @@ import logging
 import datetime
 import decimal
 import urllib.parse
+import msgpack
+import base64
+
 # Global variables to track connection state
 ws_connection = None
 connected_username = None
@@ -76,26 +79,34 @@ def ws_thread(url, username, password):
         while True:
             msg = ws.recv()
             logger.debug(f"Received raw message: {msg}")
-            print(f"Received message: {msg}")
             # Try to parse as JSON for tunnel mode
             try:
-                data = json.loads(msg)
-                if data.get("type") == "sql-query":
+                data = None
+                # Try to decode as base64-encoded MessagePack
+                try:
+                    packed = base64.b64decode(msg)
+                    data = msgpack.unpackb(packed, raw=False)
+                except Exception:
+                    # Fallback to JSON
+                    try:
+                        data = json.loads(msg)
+                    except Exception as e:
+                        logger.error(f"Failed to decode JSON: {e}")
+                        continue
+                if data and data.get("type") == "sql-query":
                     logger.info(f"Received sql-query: request_id={data.get('request_id')}, query={data.get('query')}, connectionObject={data.get('connectionObject')}")
-                    # message_queue.put({"type": "info", "message": f"Executing query: {data.get('query', '')}"})
                     connectionObject = data["connectionObject"]
                     query = data.get("query", "SELECT 1")
                     queryParams = data.get("queryParams", None)
                     request_id = data.get("request_id")
 
-                    # Prepare detailed event for sql execution info
                     sql_query_event = {
                         "type": "sql_execution_info",
                         "query": query,
                         "connectionObject": connectionObject,
                         "queryParams": queryParams,
                         "request_id": request_id,
-                        "message": f"Executing query (ID: {request_id}): {query[:100]}{'...' if len(query) > 100 else ''}" # Original message for fallback/logging
+                        "message": f"Executing query (ID: {request_id}): {query[:100]}{'...' if len(query) > 100 else ''}"
                     }
                     message_queue.put(sql_query_event)
 
@@ -131,23 +142,19 @@ def ws_thread(url, username, password):
                             engine = sqlalchemy.create_engine(url)
                         logger.info(f"Connecting to DB: {url}")
                         with engine.connect() as conn:
-                            # Use SQLAlchemy text for parametrized queries
                             stmt = sqlalchemy.text(query)
                             logger.info(f"Executing SQL: {query} with params: {queryParams}")
                             result = conn.execute(stmt, queryParams or {})
-                            # Try to fetch results if it's a SELECT
                             if result.returns_rows:
                                 rows = result.fetchall()
                                 keys = result.keys()
                                 response["keys"] = list(keys)
                                 response["rows"] = [[convert_json_safe(cell) for cell in row] for row in rows]
                                 response["rowcount"] = result.rowcount if result.rowcount is not None else len(rows)
-                                # Scalar result if only one row and one column
                                 if len(rows) == 1 and len(rows[0]) == 1:
                                     response["scalar_result"] = convert_json_safe(rows[0][0])
                             else:
                                 response["rowcount"] = result.rowcount
-                            # Optionally, return tables if requested (for metadata queries)
                             if query.strip().lower() in ("show tables", "select table_name from information_schema.tables where table_schema = database()"):
                                 inspector = sqlalchemy.inspect(engine)
                                 response["tables"] = inspector.get_table_names(schema=database)
@@ -161,7 +168,10 @@ def ws_thread(url, username, password):
                         message_queue.put({"type": "sql_error", "message": f"SQL Error: {str(e)}"})
                         logger.error(f"Query error: request_id={request_id}, error={str(e)}")
                     logger.info(f"Sending response: request_id={request_id}, success={response['success']}, rowcount={response['rowcount']}")
-                    ws.send(json.dumps(response))
+                    # Send as base64-encoded MessagePack string
+                    packed = msgpack.packb(response, use_bin_type=True)
+                    b64 = base64.b64encode(packed).decode('utf-8')
+                    ws.send(b64)
                     continue
             except Exception as e:
                 logger.error(f"Exception in ws_thread message handler: {str(e)}")
