@@ -18,8 +18,31 @@ ws_connection = None
 connected_username = None
 message_queue = Queue()  # Queue for thread-safe message passing
 
-def execute_test_connection(connectionObject, query="SELECT 1"):
-    """Executes a test query using SQLAlchemy and returns (success, message, tables)."""
+def handle_sql_query(data, logger):
+    connectionObject = data["connectionObject"]
+    query = data.get("query", "SELECT 1")
+    queryParams = data.get("queryParams", None)
+    request_id = data.get("request_id")
+
+    sql_query_event = {
+        "type": "sql_execution_info",
+        "query": query,
+        "connectionObject": connectionObject,
+        "queryParams": queryParams,
+        "request_id": request_id,
+        "message": f"Executing query (ID: {request_id}): {query[:100]}{'...' if len(query) > 100 else ''}"
+    }
+    message_queue.put(sql_query_event)
+
+    response = {
+        "type": "sql-query-result",
+        "request_id": request_id,
+        "success": False,
+        "message": "",
+        "keys": [],
+        "rows": [],
+        "rowcount": -1
+    }
     try:
         # Build SQLAlchemy URL
         dialect = connectionObject.get("dialect", "mysql")
@@ -30,7 +53,7 @@ def execute_test_connection(connectionObject, query="SELECT 1"):
         database = connectionObject["database"]
         schema = connectionObject.get("schema", None)
         if dialect == "postgresql":
-            url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}"
+            url = f"postgresql://{user}:{password}@{host}:{port}/{database}"
             connect_args = {}
             if schema:
                 connect_args["options"] = f"-c search_path={schema}"
@@ -41,17 +64,39 @@ def execute_test_connection(connectionObject, query="SELECT 1"):
         else:
             url = f"{dialect}://{user}:{password}@{host}:{port}/{database}"
             engine = sqlalchemy.create_engine(url)
-        print(f"URL: {url}")
+        logger.info(f"Connecting to DB: {url}")
         with engine.connect() as conn:
-            # Run the test query
-            conn.execute(sqlalchemy.text(query))
-            # Get table list
-            inspector = sqlalchemy.inspect(engine)
-            tables = inspector.get_table_names(schema=database)
-        return True, "Tunnel mode: Connection successful", tables
+            stmt = sqlalchemy.text(query)
+            logger.info(f"Executing SQL: {query} with params: {queryParams}")
+            result = conn.execute(stmt, queryParams or {})
+            if result.returns_rows:
+                rows = result.fetchall()
+                keys = result.keys()
+                response["keys"] = list(keys)
+                response["rows"] = [[convert_json_safe(cell) for cell in row] for row in rows]
+                response["rowcount"] = result.rowcount if result.rowcount is not None else len(rows)
+                if len(rows) == 1 and len(rows[0]) == 1:
+                    response["scalar_result"] = convert_json_safe(rows[0][0])
+            else:
+                response["rowcount"] = result.rowcount
+            if query.strip().lower() in ("show tables", "select table_name from information_schema.tables where table_schema = database()"):
+                inspector = sqlalchemy.inspect(engine)
+                response["tables"] = inspector.get_table_names(schema=database)
+            response["success"] = True
+            response["message"] = "Query executed successfully"
+            message_queue.put({"type": "sql_success", "message": f"SQL Success: {response['rowcount']} row(s) returned."})
+            logger.info(f"Query success: request_id={request_id}, rowcount={response['rowcount']}")
     except Exception as e:
-        print(f"Error: {e}")
-        return False, f"Tunnel mode: {str(e)}", []
+        response["success"] = False
+        response["message"] = str(e)
+        message_queue.put({"type": "sql_error", "message": f"SQL Error: {str(e)}"})
+        logger.error(f"Query error: request_id={request_id}, error={str(e)}")
+    logger.info(f"Sending response: request_id={request_id}, success={response['success']}, rowcount={response['rowcount']}")
+    # Send as base64-encoded MessagePack string
+    packed = msgpack.packb(response, use_bin_type=True)
+    b64 = base64.b64encode(packed).decode('utf-8')
+    if ws_connection:
+        ws_connection.send(b64)
 
 def ws_thread(url, username, password):
     global ws_connection, connected_username
@@ -78,7 +123,7 @@ def ws_thread(url, username, password):
         # Keep alive
         while True:
             msg = ws.recv()
-            logger.debug(f"Received raw message: {msg}")
+            # logger.debug(f"Received raw message: {msg}")
             # Try to parse as JSON for tunnel mode
             try:
                 data = None
@@ -94,84 +139,7 @@ def ws_thread(url, username, password):
                         logger.error(f"Failed to decode JSON: {e}")
                         continue
                 if data and data.get("type") == "sql-query":
-                    logger.info(f"Received sql-query: request_id={data.get('request_id')}, query={data.get('query')}, connectionObject={data.get('connectionObject')}")
-                    connectionObject = data["connectionObject"]
-                    query = data.get("query", "SELECT 1")
-                    queryParams = data.get("queryParams", None)
-                    request_id = data.get("request_id")
-
-                    sql_query_event = {
-                        "type": "sql_execution_info",
-                        "query": query,
-                        "connectionObject": connectionObject,
-                        "queryParams": queryParams,
-                        "request_id": request_id,
-                        "message": f"Executing query (ID: {request_id}): {query[:100]}{'...' if len(query) > 100 else ''}"
-                    }
-                    message_queue.put(sql_query_event)
-
-                    response = {
-                        "type": "sql-query-result",
-                        "request_id": request_id,
-                        "success": False,
-                        "message": "",
-                        "keys": [],
-                        "rows": [],
-                        "rowcount": -1
-                    }
-                    try:
-                        # Build SQLAlchemy URL
-                        dialect = connectionObject.get("dialect", "mysql")
-                        user = connectionObject["user"]
-                        password = connectionObject["password"]
-                        host = connectionObject["host"]
-                        port = connectionObject["port"]
-                        database = connectionObject["database"]
-                        schema = connectionObject.get("schema", None)
-                        if dialect == "postgresql":
-                            url = f"postgresql://{user}:{password}@{host}:{port}/{database}"
-                            connect_args = {}
-                            if schema:
-                                connect_args["options"] = f"-c search_path={schema}"
-                            engine = sqlalchemy.create_engine(url, connect_args=connect_args)
-                        elif dialect == "mysql":
-                            url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
-                            engine = sqlalchemy.create_engine(url)
-                        else:
-                            url = f"{dialect}://{user}:{password}@{host}:{port}/{database}"
-                            engine = sqlalchemy.create_engine(url)
-                        logger.info(f"Connecting to DB: {url}")
-                        with engine.connect() as conn:
-                            stmt = sqlalchemy.text(query)
-                            logger.info(f"Executing SQL: {query} with params: {queryParams}")
-                            result = conn.execute(stmt, queryParams or {})
-                            if result.returns_rows:
-                                rows = result.fetchall()
-                                keys = result.keys()
-                                response["keys"] = list(keys)
-                                response["rows"] = [[convert_json_safe(cell) for cell in row] for row in rows]
-                                response["rowcount"] = result.rowcount if result.rowcount is not None else len(rows)
-                                if len(rows) == 1 and len(rows[0]) == 1:
-                                    response["scalar_result"] = convert_json_safe(rows[0][0])
-                            else:
-                                response["rowcount"] = result.rowcount
-                            if query.strip().lower() in ("show tables", "select table_name from information_schema.tables where table_schema = database()"):
-                                inspector = sqlalchemy.inspect(engine)
-                                response["tables"] = inspector.get_table_names(schema=database)
-                            response["success"] = True
-                            response["message"] = "Query executed successfully"
-                            message_queue.put({"type": "sql_success", "message": f"SQL Success: {response['rowcount']} row(s) returned."})
-                            logger.info(f"Query success: request_id={request_id}, rowcount={response['rowcount']}")
-                    except Exception as e:
-                        response["success"] = False
-                        response["message"] = str(e)
-                        message_queue.put({"type": "sql_error", "message": f"SQL Error: {str(e)}"})
-                        logger.error(f"Query error: request_id={request_id}, error={str(e)}")
-                    logger.info(f"Sending response: request_id={request_id}, success={response['success']}, rowcount={response['rowcount']}")
-                    # Send as base64-encoded MessagePack string
-                    packed = msgpack.packb(response, use_bin_type=True)
-                    b64 = base64.b64encode(packed).decode('utf-8')
-                    ws.send(b64)
+                    handle_sql_query(data, logger)
                     continue
             except Exception as e:
                 logger.error(f"Exception in ws_thread message handler: {str(e)}")
