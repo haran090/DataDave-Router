@@ -384,7 +384,8 @@ def create_ui():
                 ui.notify("Please enter username and password", color="warning")
                 return
 
-            ws_url = "ws://localhost:8000/dave-router-wss"  # Change to wss://... in production
+            # ws_url = "ws://localhost:8000/dave-router-wss"  # Change to wss://... in production
+            ws_url = "wss://api.data-dave.xyz/dave-router-wss"  # Change to wss://... in production
             status_label.text = "Connecting..."
             add_terminal_message(f"Connecting to {ws_url} as {username}...", "info")
             status_image.set_source('dave_disconnected.png')  # Ensure disconnected image while connecting
