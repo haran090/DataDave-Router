@@ -17,6 +17,8 @@ import base64
 ws_connection = None
 connected_username = None
 message_queue = Queue()  # Queue for thread-safe message passing
+# ws_url = "wss://api.data-dave.ai/dave-router-wss" 
+ws_url = "ws://localhost:8000/dave-router-wss" 
 
 def handle_sql_query(data, logger):
     connectionObject = data["connectionObject"]
@@ -98,7 +100,7 @@ def handle_sql_query(data, logger):
     if ws_connection:
         ws_connection.send(b64)
 
-def ws_thread(url, username, password):
+def ws_thread(url, username=None, password=None, id_token=None):
     global ws_connection, connected_username
     logging.basicConfig(level=logging.DEBUG)
     logger = logging.getLogger("dave_router.ws_thread")
@@ -107,7 +109,15 @@ def ws_thread(url, username, password):
         ws_connection = ws
         
         # Send login
-        ws.send(json.dumps({"username": username, "password": password}))
+        if id_token:
+            ws.send(json.dumps({"id_token": id_token}))
+        elif username and password:
+            ws.send(json.dumps({"username": username, "password": password}))
+        else:
+            message_queue.put({"type": "login_failed", "message": "Missing credentials"})
+            ws.close()
+            ws_connection = None
+            return
         resp = ws.recv()
         resp_data = json.loads(resp)
         
@@ -116,10 +126,8 @@ def ws_thread(url, username, password):
             ws.close()
             ws_connection = None
             return
-            
-        connected_username = username
-        message_queue.put({"type": "connected", "message": f"Connected as {username}"})
-        
+        connected_username = username if username else resp_data.get("username", "Google User")
+        message_queue.put({"type": "connected", "message": f"Connected as {connected_username}"})
         # Keep alive
         while True:
             msg = ws.recv()
@@ -213,6 +221,39 @@ def create_ui():
     </style>
     """)
 
+    # Inject Firebase JS SDK and custom Google Sign-In logic
+    ui.add_head_html('''
+    <!-- Firebase App (the core Firebase SDK) -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+    <!-- Firebase Auth -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
+    <script>
+      // TODO: Replace with your Firebase project config
+      const firebaseConfig = {
+        apiKey: "AIzaSyAc-q-k1vQ02CXi2frxIwnkQmkIP7kaeOc",
+        authDomain: "data-dave-b5c9d.firebaseapp.com",
+        projectId: "data-dave-b5c9d",
+        appId: "1:134837140722:web:ba3f896b5c010bf773646b"
+      };
+      if (!window.firebase.apps?.length) {
+        window.firebase.initializeApp(firebaseConfig);
+      }
+      async function googleSignIn() {
+        const provider = new firebase.auth.GoogleAuthProvider();
+        try {
+          const result = await firebase.auth().signInWithPopup(provider);
+          const user = result.user;
+          if (user) {
+            const idToken = await user.getIdToken();
+            emitEvent('firebase_id_token', idToken);
+          }
+        } catch (err) {
+          emitEvent('firebase_id_token', null);
+        }
+      }
+    </script>
+    ''')
+
     # Container for vertical centering
     with ui.column().classes('w-full h-full flex items-center justify-center'):
         # Create a row with two cards
@@ -231,15 +272,14 @@ def create_ui():
                 # Status label centered below image
                 status_label = ui.label('Not Connected').classes('w-full text-center text-sm text-gray-500 dark:text-gray-400 mb-2')
 
-                # Spacer to push button to bottom
-                ui.element('div').classes('flex-grow')
-
-                # Create both buttons but only one will be visible at a time
-                with ui.row().classes('w-full justify-center mt-auto'):
-                    login_button = ui.button('Login', on_click=lambda: on_login_click()).props('color=primary rounded w-full')
-                    disconnect_button = ui.button('Disconnect', on_click=lambda: disconnect_ws()).props('color=negative rounded w-full')
-                    # Initially hide the disconnect button
+                # --- Place both buttons directly under the form inputs ---
+                with ui.column().classes('w-full gap-2 mt-2 items-stretch'):
+                    login_button = ui.button('Login', on_click=lambda: on_login_click()).props('color=primary rounded')
+                    disconnect_button = ui.button('Disconnect', on_click=lambda: disconnect_ws()).props('color=negative rounded')
                     disconnect_button.visible = False
+                    google_button = ui.button('Sign in with Google', on_click=lambda: ui.run_javascript('googleSignIn()')).props('color=secondary rounded')
+                # Spacer to push content to bottom if needed
+                ui.element('div').classes('flex-grow')
 
             # Right card - Terminal display (70% width)
             with ui.card().classes('w-[70%] p-0 rounded-xl shadow-lg overflow-hidden h-[90vh] flex flex-col bg-gray-800'):
@@ -384,8 +424,6 @@ def create_ui():
                 ui.notify("Please enter username and password", color="warning")
                 return
 
-            # ws_url = "ws://localhost:8000/dave-router-wss"  # Change to wss://... in production
-            ws_url = "wss://api.data-dave.ai/dave-router-wss" 
             status_label.text = "Connecting..."
             add_terminal_message(f"Connecting to {ws_url} as {username}...", "info")
             status_image.set_source('dave_disconnected.png')  # Ensure disconnected image while connecting
@@ -393,10 +431,27 @@ def create_ui():
             # Start WebSocket in a thread
             threading.Thread(
                 target=ws_thread,
-                args=(ws_url, username, password),
+                args=(ws_url, username, password, None),
                 daemon=True
             ).start()
-            
+        
+        # Listen for the Firebase ID token from JS and trigger login
+        def handle_firebase_id_token(id_token):
+            # print(f"Received ID token: {id_token}")
+            if not id_token:
+                status_label.text = "Google Sign-In failed"
+                add_terminal_message("Google Sign-In failed", "error")
+                ui.notify("Google Sign-In failed", color="negative")
+                return
+            status_label.text = "Connecting with Google..."
+            add_terminal_message("Connecting with Google...", "info")
+            # status_image.set_source('dave_disconnected.png')
+            threading.Thread(
+                target=ws_thread,
+                args=(ws_url, None, None, id_token),
+                daemon=True
+            ).start()
+        
         def update_ui_state():
             # Update UI elements based on connection state
             if ws_connection and connected_username:
@@ -406,6 +461,7 @@ def create_ui():
                 login_button.visible = False
                 disconnect_button.visible = True
                 disconnect_button.text = f'Disconnect'
+                google_button.visible = False
                 connection_status.classes('bg-green-500', remove='bg-red-500')
                 connection_status.text = f'Connected'
             else:
@@ -414,6 +470,7 @@ def create_ui():
                 password_input.disabled = False
                 login_button.visible = True
                 disconnect_button.visible = False
+                google_button.visible = True
                 connection_status.classes('bg-red-500', remove='bg-green-500')
                 connection_status.text = 'Disconnected'
         
@@ -457,6 +514,8 @@ def create_ui():
 
         # Set up a timer to check for messages from the WebSocket thread
         ui.timer(0.5, check_messages)
+
+        ui.on("firebase_id_token", lambda e: handle_firebase_id_token(e.args))
 
 # Run the NiceGUI app
 def main():
