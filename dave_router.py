@@ -46,27 +46,73 @@ def handle_sql_query(data, logger):
         "rowcount": -1
     }
     try:
-        # Build SQLAlchemy URL
+        # Build SQLAlchemy URL and connect_args - replicate backend logic
         dialect = connectionObject.get("dialect", "mysql")
-        user = connectionObject["user"]
-        password = connectionObject["password"]
-        host = connectionObject["host"]
-        port = connectionObject["port"]
-        database = connectionObject["database"]
-        schema = connectionObject.get("schema", None)
+        user = connectionObject.get("user")
+        password = connectionObject.get("password")
+        host = connectionObject.get("host")
+        port = connectionObject.get("port")
+        database = connectionObject.get("database")
+
+        url = ""
+        connect_args = {}
+
+        # --- DIALECT-SPECIFIC LOGIC (replicating backend adapters) ---
         if dialect == "postgresql":
-            url = f"postgresql://{user}:{password}@{host}:{port}/{database}"
-            connect_args = {}
-            if schema:
-                connect_args["options"] = f"-c search_path={schema}"
-            engine = sqlalchemy.create_engine(url, connect_args=connect_args)
+            # Handle multi-schema for PostgreSQL
+            schemas = connectionObject.get("schemas")
+            if schemas and isinstance(schemas, list):
+                # Safely quote schema names and join them
+                quoted_schemas = [f'"{s.strip()}"' for s in schemas]
+                connect_args["options"] = f"-c search_path={','.join(quoted_schemas)}"
+                logger.info(f"PostgreSQL multi-schema mode. Setting search_path to: {','.join(quoted_schemas)}")
+            elif connectionObject.get("schema"):
+                # Handle legacy single schema
+                connect_args["options"] = f"-c search_path={connectionObject['schema']}"
+                logger.info(f"PostgreSQL single-schema mode. Setting search_path to: {connectionObject['schema']}")
+
+            # Use the correct driver for postgresql
+            url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}"
+
+        elif dialect == "snowflake":
+            # Handle Snowflake's extra connection parameters
+            # The snowflake-sqlalchemy dialect reads these from the URL query string
+            params = {}
+            if connectionObject.get("schema"):
+                params['schema'] = connectionObject.get("schema")
+            if connectionObject.get("warehouse"):
+                params['warehouse'] = connectionObject.get("warehouse")
+            if connectionObject.get("role"):
+                params['role'] = connectionObject.get("role")
+            
+            url = f"snowflake://{user}:{password}@{host}:{port}/{database}"
+            if params:
+                url += f"?{urllib.parse.urlencode(params)}"
+            
+            logger.info(f"Snowflake connection with params: {params}")
+
+        elif dialect == "bigquery":
+            # BigQuery uses the project_id as the "host" and may have a default dataset
+            project_id = connectionObject.get("database")  # Mapped to project_id on the backend
+            dataset = connectionObject.get("schema")  # Mapped to a single dataset
+            if dataset:
+                url = f"bigquery://{project_id}/{dataset}"
+            else:
+                url = f"bigquery://{project_id}"
+            logger.info(f"BigQuery connection url: {url}")
+
         elif dialect == "mysql":
             url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
-            engine = sqlalchemy.create_engine(url)
+
         else:
+            # Fallback for other dialects
             url = f"{dialect}://{user}:{password}@{host}:{port}/{database}"
-            engine = sqlalchemy.create_engine(url)
-        logger.info(f"Connecting to DB: {url}")
+
+        # --- END DIALECT-SPECIFIC LOGIC ---
+
+        logger.info(f"Connecting to DB with dialect '{dialect}': {url}")
+        engine = sqlalchemy.create_engine(url, connect_args=connect_args)
+        
         with engine.connect() as conn:
             stmt = sqlalchemy.text(query)
             logger.info(f"Executing SQL: {query} with params: {queryParams}")
