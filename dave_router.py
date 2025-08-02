@@ -17,8 +17,8 @@ import base64
 ws_connection = None
 connected_username = None
 message_queue = Queue()  # Queue for thread-safe message passing
-# ws_url = "wss://api.data-dave.ai/dave-router-wss" 
-ws_url = "ws://localhost:8000/dave-router-wss" 
+ws_url = "wss://api.data-dave.ai/dave-router-wss" 
+#ws_url = "ws://localhost:8000/dave-router-wss" 
 
 def handle_sql_query(data, logger):
     connectionObject = data["connectionObject"]
@@ -75,9 +75,11 @@ def handle_sql_query(data, logger):
             url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}"
 
         elif dialect == "snowflake":
+            # Always use external browser authentication for Snowflake
+            authenticator = "externalbrowser"
+            
             # Handle Snowflake's extra connection parameters
-            # The snowflake-sqlalchemy dialect reads these from the URL query string
-            params = {}
+            params = {"authenticator": authenticator}
             if connectionObject.get("schema"):
                 params['schema'] = connectionObject.get("schema")
             if connectionObject.get("warehouse"):
@@ -85,11 +87,13 @@ def handle_sql_query(data, logger):
             if connectionObject.get("role"):
                 params['role'] = connectionObject.get("role")
             
-            url = f"snowflake://{user}:{password}@{host}:{port}/{database}"
+            # Build URL for external browser authentication (no password, no port)
+            url = f"snowflake://{user}@{host}/{database}"
+            
             if params:
                 url += f"?{urllib.parse.urlencode(params)}"
             
-            logger.info(f"Snowflake connection with params: {params}")
+            logger.info(f"Snowflake connection with external browser auth: {params}")
 
         elif dialect == "bigquery":
             # BigQuery uses the project_id as the "host" and may have a default dataset
