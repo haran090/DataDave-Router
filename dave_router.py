@@ -12,6 +12,8 @@ import decimal
 import urllib.parse
 import msgpack
 import base64
+from multiprocessing import freeze_support
+freeze_support()
 
 # Global variables to track connection state
 ws_connection = None
@@ -570,7 +572,7 @@ def create_ui():
 # Run the NiceGUI app
 def main():
     create_ui()
-    ui.run(title='Dave Router', port=8180, favicon="https://cdn-icons-png.flaticon.com/128/6584/6584942.png")
+    ui.run(reload=False, title='Dave Router', port=8180, favicon="https://cdn-icons-png.flaticon.com/128/6584/6584942.png")
 
 # Helper to convert values to JSON-serializable types
 def convert_json_safe(val):
