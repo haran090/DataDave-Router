@@ -19,8 +19,8 @@ freeze_support()
 ws_connection = None
 connected_username = None
 message_queue = Queue()  # Queue for thread-safe message passing
-ws_url = "wss://api.data-dave.ai/dave-router-wss" 
-#ws_url = "ws://localhost:8000/dave-router-wss" 
+# ws_url = "wss://api.data-dave.ai/dave-router-wss" 
+ws_url = "ws://localhost:8000/dave-router-wss" 
 
 def handle_sql_query(data, logger):
     connectionObject = data["connectionObject"]
@@ -77,25 +77,29 @@ def handle_sql_query(data, logger):
             url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{database}"
 
         elif dialect == "snowflake":
-            # Always use external browser authentication for Snowflake
-            authenticator = "externalbrowser"
-            
-            # Handle Snowflake's extra connection parameters
-            params = {"authenticator": authenticator}
+            # Router-side: optionally use external browser auth when requested
+            use_external = bool(connectionObject.get("snowflake_externalbrowser"))
+            params = {}
             if connectionObject.get("schema"):
                 params['schema'] = connectionObject.get("schema")
             if connectionObject.get("warehouse"):
                 params['warehouse'] = connectionObject.get("warehouse")
             if connectionObject.get("role"):
                 params['role'] = connectionObject.get("role")
-            
-            # Build URL for external browser authentication (no password, no port)
-            url = f"snowflake://{user}@{host}/{database}"
-            
+
+            if use_external:
+                params["authenticator"] = "externalbrowser"
+                url = f"snowflake://{user}@{host}/{database}"
+                logger.info(f"Snowflake connection using external browser auth")
+            else:
+                # Fallback to password/PAT if provided
+                if not password:
+                    raise ValueError("Snowflake password/PAT is required when not using external browser auth")
+                url = f"snowflake://{user}:{password}@{host}/{database}"
+                logger.info(f"Snowflake connection using password/PAT")
+
             if params:
                 url += f"?{urllib.parse.urlencode(params)}"
-            
-            logger.info(f"Snowflake connection with external browser auth: {params}")
 
         elif dialect == "bigquery":
             # BigQuery uses the project_id as the "host" and may have a default dataset
