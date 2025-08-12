@@ -22,6 +22,62 @@ message_queue = Queue()  # Queue for thread-safe message passing
 # ws_url = "wss://api.data-dave.ai/dave-router-wss" 
 ws_url = "ws://localhost:8000/dave-router-wss" 
 
+# Engine/session cache to avoid repeated authentications (esp. Snowflake external browser)
+_engine_cache_lock = threading.Lock()
+_engine_cache = {}
+
+def _connection_key_from_object(connection_object: dict) -> str:
+    """Create a stable key identifying a logical DB session target.
+
+    We include only fields relevant to authentication/session routing so engines
+    can be reused across queries for the same target.
+    """
+    # Normalize values and include common Snowflake params when present
+    key_fields = {
+        "dialect": connection_object.get("dialect"),
+        "user": connection_object.get("user"),
+        "host": connection_object.get("host"),
+        "port": connection_object.get("port"),
+        "database": connection_object.get("database"),
+        # Optional/driver-specific extras that may affect auth/session
+        "schema": connection_object.get("schema"),
+        "role": connection_object.get("role"),
+        "warehouse": connection_object.get("warehouse"),
+        # For Snowflake: whether external browser auth is used
+        "snowflake_externalbrowser": bool(connection_object.get("snowflake_externalbrowser")),
+    }
+    # Stable JSON key
+    return json.dumps(key_fields, sort_keys=True, separators=(",", ":"))
+
+def _get_or_create_engine(url: str, connect_args: dict, conn_key: str, logger: logging.Logger) -> sqlalchemy.Engine:
+    """Return a cached SQLAlchemy engine for this connection key, creating it if needed.
+
+    Reusing engines lets the underlying connector keep sessions alive and
+    leverage any token/credential caching, which prevents repeated SSO prompts.
+    """
+    with _engine_cache_lock:
+        engine_entry = _engine_cache.get(conn_key)
+        if engine_entry:
+            logger.debug("Reusing cached engine for key=%s", conn_key)
+            return engine_entry["engine"]
+
+        # Create a new engine with reasonable pool settings
+        # - pool_pre_ping: validate connections before use
+        # - pool_recycle: recycle connections periodically to avoid stale sessions
+        engine = sqlalchemy.create_engine(
+            url,
+            connect_args=connect_args,
+            pool_pre_ping=True,
+            pool_recycle=1800,  # 30 minutes
+        )
+        _engine_cache[conn_key] = {
+            "engine": engine,
+            "created_at": time.time(),
+            "last_used_at": time.time(),
+        }
+        logger.debug("Created new engine and cached for key=%s", conn_key)
+        return engine
+
 def handle_sql_query(data, logger):
     connectionObject = data["connectionObject"]
     query = data.get("query", "SELECT 1")
@@ -89,8 +145,10 @@ def handle_sql_query(data, logger):
 
             if use_external:
                 params["authenticator"] = "externalbrowser"
+                # Enable connector-side token caching to avoid repeated SSO prompts
+                connect_args["client_store_temporary_credential"] = True
                 url = f"snowflake://{user}@{host}/{database}"
-                logger.info(f"Snowflake connection using external browser auth")
+                logger.info(f"Snowflake connection using external browser auth with token caching enabled")
             else:
                 # Fallback to password/PAT if provided
                 if not password:
@@ -120,8 +178,16 @@ def handle_sql_query(data, logger):
 
         # --- END DIALECT-SPECIFIC LOGIC ---
 
+        # Enable session keep-alive for Snowflake to minimize re-auth prompts
+        if dialect == "snowflake":
+            # Supported by snowflake-connector; keeps the session active in the background
+            connect_args = dict(connect_args)  # copy before mutating
+            connect_args.setdefault("client_session_keep_alive", True)
+
         logger.info(f"Connecting to DB with dialect '{dialect}': {url}")
-        engine = sqlalchemy.create_engine(url, connect_args=connect_args)
+        # Reuse cached engine for the same logical target to prevent repeated auth
+        conn_key = _connection_key_from_object(connectionObject)
+        engine = _get_or_create_engine(url, connect_args, conn_key, logger)
         
         with engine.connect() as conn:
             stmt = sqlalchemy.text(query)
